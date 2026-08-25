@@ -1,0 +1,34 @@
+services:
+  api:
+    build:
+      context: ./services/api
+    container_name: specloop-api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    environment:
+      - SPECLOOP_DATA_DIR=/data
+    volumes:
+      - spec-data:/data
+    command: .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  web:
+    build:
+      context: ./apps/web
+    container_name: specloop-web
+    env_file:
+      - .env
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - api
+
+volumes:
+  spec-data:

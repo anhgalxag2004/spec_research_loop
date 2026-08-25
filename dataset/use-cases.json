@@ -1,0 +1,14 @@
+[
+  {
+    "id": "flood-risk",
+    "idea": "Build an early-warning system that predicts urban flood risk from rainfall, river level, and terrain data.",
+    "resource": "RTX 3090",
+    "expected_evidence_verdict": "INSUFFICIENT"
+  },
+  {
+    "id": "paper-claims",
+    "idea": "Evaluate whether claim-evidence verification reduces unsupported statements during academic paper extraction.",
+    "resource": "RTX 3090",
+    "expected_evidence_verdict": "INSUFFICIENT"
+  }
+]
