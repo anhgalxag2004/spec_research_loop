@@ -1,68 +1,142 @@
-# SpecResearch Loop - Full Version (2-Day Build)
+# SpecResearch Loop
 
-Monorepo template for a complete MVP:
+SpecResearch Loop is a research-specification assistant that turns a research
+idea into a versioned, reviewable research specification. The system supports
+idea clarification, decomposition, source/evidence recording, experiment
+planning, independent Judge reviews, user revisions, and final Markdown export.
 
-- Frontend: Next.js 15 + TypeScript
-- Backend: FastAPI + uv
-- Runtime: Docker Desktop with Docker Compose
+## Objectives
 
-## 1) What this build includes
+- Convert an unstructured research idea into problem, gap, contribution, claim,
+  evidence, experiment, and feasibility artifacts.
+- Require evidence records before presenting a source as verified.
+- Keep user decisions and immutable spec versions so a review can be traced.
+- Run multiple Judge roles against the latest stored spec and record the exact
+  version each Judge evaluated.
 
-- Idea input and reinterpretation.
-- Problem decomposition into cards (problem, gap, claim, evidence, constraints).
-- Draft research spec generator.
-- Five independent Judge roles with `spec_version_used` provenance.
-- Persisted user decisions, source/evidence records, consensus, version history, and server-side diffs.
-- Final Markdown export and persisted publication confirmation.
-- OpenAI-compatible runtime configuration, including local Ollama.
+## Technology
 
-## 2) Project structure
+| Layer       | Technology                            |
+| ----------- | ------------------------------------- |
+| Frontend    | Next.js 15, React 19, TypeScript      |
+| Backend     | FastAPI, Pydantic, uv                 |
+| Persistence | SQLite in a Docker volume             |
+| Runtime     | Docker Desktop and Docker Compose     |
+| AI adapter  | OpenAI-compatible API or local Ollama |
 
-- `apps/web`: Next.js frontend.
-- `services/api`: FastAPI backend managed by uv.
-- `docker-compose.yml`: Run all services in Docker Desktop.
+## Research Workflow
 
-## 3) Quick start
+1. Enter and clarify a research idea.
+2. Decompose the idea into problem, research question, gap, contribution,
+   evidence, and constraint cards.
+3. Record related-work sources, claims, passages, and verification verdicts.
+4. Select and persist a research-gap decision.
+5. Build claim-evidence cards, an experiment plan, and a feasibility estimate.
+6. Generate a draft research specification.
+7. Run five independent Judge roles: Gap, Contribution, Experiment, Evidence,
+   and Conference Readiness.
+8. Aggregate latest-version Judge consensus and issues.
+9. Apply a user revision, create a new immutable spec version, and rerun Judge.
+10. Inspect decision log/version diff, confirm, and export final Markdown.
 
-1. Copy env file.
-   - `copy .env.example .env`
-2. Start Docker Desktop.
-3. Run stack:
-   - `docker compose up --build`
-4. Open:
+## Key Capabilities
+
+- Input-specific research workspace: the application does not prefill a fixed
+  prompt-optimization example.
+- Source/evidence records with `SUPPORTED`, `CONTRADICTED`, and `INSUFFICIENT`
+  verdicts, each stored with source URL and quoted passage.
+- Persistent user decisions for gap selection, revision strategy, and final
+  publication confirmation.
+- Version history and server-side unified diff between two spec versions.
+- Judge provenance through `spec_version_used`; old Judge results become stale
+  when a newer spec is created.
+- Configurable AI runtime with transparent `live` or deterministic fallback
+  mode.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Web[Next.js Web] --> API[FastAPI API]
+  API --> Agents[Planner / Revision Agent / Judges]
+  API --> Store[(SQLite State Store)]
+  Store --> Versions[Spec Versions]
+  Store --> Decisions[User Decisions]
+  Store --> Evidence[Evidence Records]
+  Store --> JudgeRuns[Judge Runs]
+```
+
+More detail is available in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Quick Start
+
+1. Copy the environment template:
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+2. Configure an AI runtime in `.env`.
+
+   For local Ollama:
+
+   ```dotenv
+   LLM_PROVIDER=ollama
+   LLM_BASE_URL=http://host.docker.internal:11434/v1
+   LLM_API_KEY=ollama
+   LLM_MODEL=qwen3:4b
+   ```
+
+3. Start Docker Desktop, then run:
+
+   ```powershell
+   docker compose up --build
+   ```
+
+4. Open the services:
    - Web: http://localhost:3000
-   - API docs: http://localhost:8000/docs
+   - API documentation: http://localhost:8000/docs
 
-## 4) Day-by-day delivery plan
+## Project Structure
 
-### Day 1
+```text
+apps/web/                 Next.js application
+services/api/             FastAPI application and tests
+dataset/use-cases.json    Example research use cases
+docs/prompts.md           Planner, Judge, and Revision prompts
+docs/evaluation-protocol.md  Baselines, metrics, and demo procedure
+ARCHITECTURE.md           Architecture and state model
+docker-compose.yml        Local runtime configuration
+```
 
-- Scaffold backend and frontend.
-- Implement core flow: idea -> decomposition -> draft spec.
-- Build API contracts and wire frontend forms.
-- Add basic UI for cards, judge feedback, and revision decisions.
+## Validation
 
-### Day 2
+Run backend acceptance tests:
 
-- Complete judge loop and decision history UI.
-- Improve validation, error states, loading UX.
-- Add tests for core API services.
-- Finalize README, architecture notes, demo script.
+```powershell
+docker compose run --rm --no-deps --entrypoint sh api -c "cd /app && PYTHONPATH=/app uv run --no-project --with pytest --with httpx2 pytest"
+```
 
-## 5) Submission artifacts
+Build the frontend:
+
+```powershell
+docker compose run --rm --no-deps web npm run build
+```
+
+## Submission Artifacts
 
 - [Architecture](ARCHITECTURE.md)
-- [LLM prompts](docs/prompts.md)
+- [Prompt catalogue](docs/prompts.md)
 - [Use-case dataset](dataset/use-cases.json)
-- [Evaluation protocol and two baselines](docs/evaluation-protocol.md)
+- [Evaluation protocol with two baselines](docs/evaluation-protocol.md)
 
-## 6) Evidence workflow
+## Evidence Scope
 
-Step 3 lets a researcher save a source URL, target claim, quoted passage, and
-evidence verdict (`SUPPORTED`, `CONTRADICTED`, or `INSUFFICIENT`). The system
-does not claim a source is verified unless that evidence record exists.
+Step 3 allows a researcher to store a source URL, target claim, quote, and
+verification verdict. The current release does not automatically crawl
+scholarly databases; automatic search/retrieval is a planned integration.
 
-## 7) Local development without Docker (optional)
+## Local Development (Optional)
 
 ### Backend
 
@@ -76,7 +150,7 @@ does not claim a source is verified unless that evidence record exists.
 - `npm install`
 - `npm run dev`
 
-## 8) Suggested next upgrades
+## Future Improvements
 
 - Add an external scholarly search/retrieval connector for automatic evidence collection.
 - Add multi-provider Judge assignment to compare model bias.
