@@ -1,23 +1,42 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { RouteHeader } from "@/components/RouteHeader";
 import {
   getActiveWorkspace,
+  getCompiledSpec,
+  getDecisions,
+  getEvidenceAnalysis,
   getEvidence,
   getJudgeConsensus,
+  getRelatedWork,
+  getVersionDiff,
   reviseSpec,
   runLatestSpecJudges,
   saveDecision,
   saveEvidence,
+  saveRelatedWork,
+  searchSources,
   setActiveWorkspace,
   type AnalyzeResponse,
+  type CompiledSpecResponse,
+  type DecisionRecord,
+  type EvidenceFinding,
   type EvidenceRecord,
   type JudgeConsensus,
+  type RelatedWorkRecord,
+  type SourceSearchItem,
+  type VersionDiff,
 } from "@/lib/api";
+import {
+  LAST_WORKFLOW_STAGE,
+  getHighestAccessibleStage,
+  getWorkflowPath,
+  stepConfirmationType,
+} from "@/lib/workflow";
 
 const STAGES: Record<string, { title: string; subtitle: string }> = {
   "2": {
@@ -75,7 +94,19 @@ const STATUS_LABELS: Record<string, string> = {
   CONFLICT: "Mâu thuẫn",
 };
 
-function Wizard({ current }: { current: string }) {
+const SPEC_STATUS_LABELS: Record<string, string> = {
+  READY: "Đủ thông tin",
+  NEEDS_INPUT: "Cần bổ sung",
+  WARNING: "Cần xem lại",
+};
+
+function Wizard({
+  current,
+  accessibleStage,
+}: {
+  current: string;
+  accessibleStage: number;
+}) {
   return (
     <nav className="route-wizard" aria-label="Tiến trình dự án">
       {[
@@ -89,21 +120,46 @@ function Wizard({ current }: { current: string }) {
         ["8", "Research spec", "/step/8"],
         ["9", "Judge", "/step/9"],
         ["10", "Sửa đổi", "/step/10"],
-      ].map(([number, label, href]) => (
-        <Link
-          className={current === number ? "route-step active" : "route-step"}
-          href={href}
-          key={number}
-        >
-          <b>{Number(current) > Number(number) ? "✓" : number}</b>
-          {label}
-        </Link>
-      ))}
+      ].map(([number, label, href]) => {
+        const targetStage = Number(number);
+        const isLocked = targetStage > accessibleStage;
+        if (isLocked) {
+          return (
+            <span
+              aria-disabled="true"
+              className="route-step locked"
+              key={number}
+              title={`Hoàn thành bước ${accessibleStage} trước để mở bước này.`}
+            >
+              <b>{number}</b>
+              {label}
+            </span>
+          );
+        }
+        return (
+          <Link
+            className={current === number ? "route-step active" : "route-step"}
+            href={href}
+            key={number}
+          >
+            <b>{number}</b>
+            {label}
+          </Link>
+        );
+      })}
     </nav>
   );
 }
 
-function StageActions({ stage }: { stage: number }) {
+function StageActions({
+  stage,
+  onAdvance,
+  advanceState,
+}: {
+  stage: number;
+  onAdvance: (completedStage: number) => Promise<void>;
+  advanceState: "idle" | "saving" | "error";
+}) {
   return (
     <div className="route-actions">
       <Link
@@ -113,9 +169,19 @@ function StageActions({ stage }: { stage: number }) {
         ← Quay lại
       </Link>
       {stage < 10 ? (
-        <Link className="next-route" href={`/step/${stage + 1}`}>
-          Xác nhận & tiếp tục →
-        </Link>
+        <button
+          className="next-route"
+          disabled={advanceState === "saving"}
+          onClick={() => void onAdvance(stage)}
+          type="button"
+        >
+          {advanceState === "saving"
+            ? "Đang lưu checkpoint..."
+            : "Xác nhận & tiếp tục →"}
+        </button>
+      ) : null}
+      {advanceState === "error" ? (
+        <p className="form-error">Không thể lưu checkpoint của bước này.</p>
       ) : null}
     </div>
   );
@@ -123,15 +189,25 @@ function StageActions({ stage }: { stage: number }) {
 
 export default function StagePage() {
   const params = useParams<{ stage: string }>();
+  const router = useRouter();
   const stage = params.stage;
+  const currentStage = Number(stage);
   const config = STAGES[stage] ?? STAGES["2"];
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(
     getActiveWorkspace,
   );
-  const [workspaceChecked, setWorkspaceChecked] = useState(
-    Boolean(getActiveWorkspace()),
+  const [workspaceChecked, setWorkspaceChecked] = useState(false);
+  const [workflowDecisions, setWorkflowDecisions] = useState<DecisionRecord[]>(
+    [],
   );
-  const [gapChoice, setGapChoice] = useState("B");
+  const [workflowState, setWorkflowState] = useState<
+    "loading" | "ready" | "error"
+  >("loading");
+  const [advanceState, setAdvanceState] = useState<"idle" | "saving" | "error">(
+    "idle",
+  );
+  const [gapChoice, setGapChoice] = useState("focus-gap");
+  const [customGap, setCustomGap] = useState("");
   const [revisionStrategy, setRevisionStrategy] = useState<
     "NARROW_CLAIM" | "EXPAND_EXPERIMENT" | "TURN_INTO_QUESTION" | "CUSTOM"
   >("NARROW_CLAIM");
@@ -143,7 +219,37 @@ export default function StagePage() {
     "idle",
   );
   const [evidence, setEvidence] = useState<EvidenceRecord[]>([]);
+  const [evidenceFindings, setEvidenceFindings] = useState<EvidenceFinding[]>(
+    [],
+  );
+  const [sourceQuery, setSourceQuery] = useState("");
+  const [sourceResults, setSourceResults] = useState<SourceSearchItem[]>([]);
+  const [relatedWork, setRelatedWork] = useState<RelatedWorkRecord[]>([]);
+  const [relatedWorkState, setRelatedWorkState] = useState<
+    "idle" | "saving" | "error"
+  >("idle");
+  const [showRelatedWorkForm, setShowRelatedWorkForm] = useState(false);
+  const [relatedWorkForm, setRelatedWorkForm] = useState({
+    title: "",
+    url: "",
+    year: null as number | null,
+    approach: "",
+    limitation: "",
+  });
+  const [searchState, setSearchState] = useState<
+    "idle" | "searching" | "error"
+  >("idle");
   const [consensus, setConsensus] = useState<JudgeConsensus | null>(null);
+  const [compiledSpec, setCompiledSpec] = useState<CompiledSpecResponse | null>(
+    null,
+  );
+  const [revisionDiff, setRevisionDiff] = useState<VersionDiff | null>(null);
+  const [cardConfirmationState, setCardConfirmationState] = useState<
+    "idle" | "saving" | "error"
+  >("idle");
+  const [gapDecisionState, setGapDecisionState] = useState<
+    "idle" | "saving" | "error"
+  >("idle");
   const [sourceState, setSourceState] = useState<"idle" | "saving" | "error">(
     "idle",
   );
@@ -158,9 +264,18 @@ export default function StagePage() {
   const contributionCards = analysis?.cards.filter(
     (card) => card.type === "Contribution" || card.type === "Research question",
   );
+  const accessibleStage = getHighestAccessibleStage(workflowDecisions);
+  const isFinalReviewConfirmed = workflowDecisions.some(
+    (decision) => decision.decision_type === stepConfirmationType(10),
+  );
 
   useEffect(() => {
-    if (getActiveWorkspace()) return;
+    const activeWorkspace = getActiveWorkspace();
+    if (activeWorkspace) {
+      setAnalysis(activeWorkspace);
+      setWorkspaceChecked(true);
+      return;
+    }
     const stored = sessionStorage.getItem("specloop-workspace");
     if (stored) {
       const workspace = JSON.parse(stored) as AnalyzeResponse;
@@ -171,17 +286,90 @@ export default function StagePage() {
   }, []);
 
   useEffect(() => {
+    if (!workspaceChecked) return;
+    if (!analysis) {
+      router.replace("/");
+      return;
+    }
+
+    let cancelled = false;
+    setWorkflowState("loading");
+    void getDecisions(analysis.project_id)
+      .then((decisions) => {
+        if (cancelled) return;
+        setWorkflowDecisions(decisions);
+        setWorkflowState("ready");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setWorkflowState("error");
+        router.replace("/");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [analysis?.project_id, router, workspaceChecked]);
+
+  useEffect(() => {
+    if (!analysis || workflowState !== "ready") return;
+    if (
+      !Number.isInteger(currentStage) ||
+      currentStage < 2 ||
+      currentStage > LAST_WORKFLOW_STAGE ||
+      currentStage > accessibleStage
+    ) {
+      router.replace(getWorkflowPath(accessibleStage));
+    }
+  }, [analysis, accessibleStage, currentStage, router, workflowState]);
+
+  useEffect(() => {
     if (!analysis) return;
     void Promise.all([
       getEvidence(analysis.project_id),
       getJudgeConsensus(analysis.project_id),
+      getEvidenceAnalysis(analysis.project_id),
+      getRelatedWork(analysis.project_id),
     ])
-      .then(([records, nextConsensus]) => {
+      .then(([records, nextConsensus, findings, relatedRecords]) => {
         setEvidence(records);
         setConsensus(nextConsensus);
+        setEvidenceFindings(findings);
+        setRelatedWork(relatedRecords);
       })
       .catch(() => undefined);
-  }, [analysis?.project_id]);
+  }, [analysis?.project_id, analysis?.version]);
+
+  useEffect(() => {
+    if (!analysis || stage !== "3") return;
+    const suggestedQuery = analysis.input_idea.trim();
+    if (suggestedQuery.length < 3) return;
+
+    let cancelled = false;
+    setSourceQuery(suggestedQuery);
+    setSearchState("searching");
+    void searchSources(analysis.project_id, suggestedQuery)
+      .then((sources) => {
+        if (!cancelled) {
+          setSourceResults(sources);
+          setSearchState("idle");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSearchState("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [analysis?.project_id, stage]);
+
+  useEffect(() => {
+    if (!analysis || stage !== "8") return;
+    void getCompiledSpec(analysis.project_id)
+      .then(setCompiledSpec)
+      .catch(() => setCompiledSpec(null));
+  }, [analysis?.project_id, analysis?.version, stage]);
 
   function persistWorkspace(next: AnalyzeResponse) {
     setAnalysis(next);
@@ -189,13 +377,48 @@ export default function StagePage() {
     sessionStorage.setItem("specloop-workspace", JSON.stringify(next));
   }
 
+  async function advanceStage(completedStage: number) {
+    if (!analysis || completedStage > accessibleStage) return;
+    if (completedStage < accessibleStage) {
+      router.push(`/step/${completedStage + 1}`);
+      return;
+    }
+    setAdvanceState("saving");
+    try {
+      const decision = await saveDecision(
+        analysis.project_id,
+        stepConfirmationType(completedStage),
+        `User confirmed workflow step ${completedStage}.`,
+      );
+      setWorkflowDecisions((current) => [decision, ...current]);
+      setAdvanceState("idle");
+      router.push(
+        completedStage === LAST_WORKFLOW_STAGE
+          ? "/final"
+          : `/step/${completedStage + 1}`,
+      );
+    } catch {
+      setAdvanceState("error");
+    }
+  }
+
+  const stageActions = (
+    <StageActions
+      advanceState={advanceState}
+      onAdvance={advanceStage}
+      stage={currentStage}
+    />
+  );
+
   async function applyRevision() {
     if (!analysis) return;
+    const previousVersion = analysis.version;
     setRevisionState("saving");
     try {
+      const canonicalSpec = await getCompiledSpec(analysis.project_id);
       const revised = await reviseSpec(
         analysis.project_id,
-        analysis.draft_spec,
+        canonicalSpec.content,
         revisionStrategy,
         customNote,
       );
@@ -208,6 +431,12 @@ export default function StagePage() {
         agent_runtime: revised.agent_runtime,
         judge_runs: revised.judge_runs,
       });
+      const [nextConsensus, nextDiff] = await Promise.all([
+        getJudgeConsensus(analysis.project_id),
+        getVersionDiff(analysis.project_id, previousVersion, revised.version),
+      ]);
+      setConsensus(nextConsensus);
+      setRevisionDiff(nextDiff);
       setRevisionState("done");
     } catch {
       setRevisionState("error");
@@ -239,6 +468,7 @@ export default function StagePage() {
     try {
       const record = await saveEvidence(analysis.project_id, sourceForm);
       setEvidence((records) => [record, ...records]);
+      setEvidenceFindings(await getEvidenceAnalysis(analysis.project_id));
       setSourceForm({
         title: "",
         url: "",
@@ -252,36 +482,88 @@ export default function StagePage() {
     }
   }
 
-  async function selectGap(value: string) {
+  async function selectGap(choice: string, value: string) {
     if (!analysis) return;
-    setGapChoice(value);
+    setGapChoice(choice);
+    setGapDecisionState("saving");
     try {
       await saveDecision(analysis.project_id, "RESEARCH_GAP", value);
+      setGapDecisionState("idle");
     } catch {
-      setJudgeState("error");
+      setGapDecisionState("error");
     }
   }
 
-  if (!workspaceChecked)
+  async function confirmCard(card: AnalyzeResponse["cards"][number]) {
+    if (!analysis || card.status === "CONFIRMED") return;
+    setCardConfirmationState("saving");
+    try {
+      await saveDecision(
+        analysis.project_id,
+        "CARD_CONFIRMATION",
+        JSON.stringify({
+          type: card.type,
+          content: card.content,
+          status: "CONFIRMED",
+        }),
+      );
+      persistWorkspace({
+        ...analysis,
+        cards: analysis.cards.map((item) =>
+          item === card ? { ...item, status: "CONFIRMED" } : item,
+        ),
+      });
+      setCardConfirmationState("idle");
+    } catch {
+      setCardConfirmationState("error");
+    }
+  }
+
+  async function findSources() {
+    if (!analysis || sourceQuery.trim().length < 3) return;
+    setSearchState("searching");
+    try {
+      setSourceResults(await searchSources(analysis.project_id, sourceQuery));
+      setSearchState("idle");
+    } catch {
+      setSearchState("error");
+    }
+  }
+
+  async function saveRelatedWorkSource() {
+    if (!analysis) return;
+    setRelatedWorkState("saving");
+    try {
+      const record = await saveRelatedWork(
+        analysis.project_id,
+        relatedWorkForm,
+      );
+      setRelatedWork((records) => [record, ...records]);
+      setRelatedWorkForm({
+        title: "",
+        url: "",
+        year: null,
+        approach: "",
+        limitation: "",
+      });
+      setShowRelatedWorkForm(false);
+      setRelatedWorkState("idle");
+    } catch {
+      setRelatedWorkState("error");
+    }
+  }
+
+  if (!workspaceChecked || workflowState === "loading")
     return <main className="workspace-pending" aria-busy="true" />;
 
-  if (!analysis)
-    return (
-      <main className="empty-workspace">
-        <h1>Chưa có research workspace</h1>
-        <p>
-          Hãy bắt đầu từ ý tưởng nghiên cứu để hệ thống tạo dữ liệu cho các bước
-          tiếp theo.
-        </p>
-        <a href="/">Quay lại bước 1</a>
-      </main>
-    );
+  if (!analysis || workflowState === "error")
+    return <main className="workspace-pending" aria-busy="true" />;
 
   return (
     <>
       <RouteHeader />
       <main className="route-page">
-        <Wizard current={stage} />
+        <Wizard current={stage} accessibleStage={accessibleStage} />
         <p className="route-project">
           Research workspace: {analysis.project_id} · Readiness{" "}
           {analysis.readiness_score}/100
@@ -333,28 +615,23 @@ export default function StagePage() {
                   <p>{card.content}</p>
                   <button
                     className="text-action"
-                    onClick={() =>
-                      persistWorkspace({
-                        ...analysis,
-                        cards: analysis.cards.map((item) =>
-                          item === card
-                            ? { ...item, status: "CONFIRMED" }
-                            : item,
-                        ),
-                      })
+                    disabled={
+                      card.status === "CONFIRMED" ||
+                      cardConfirmationState === "saving"
                     }
+                    onClick={() => void confirmCard(card)}
                   >
-                    Xác nhận thẻ
+                    {card.status === "CONFIRMED"
+                      ? "Đã xác nhận"
+                      : "Xác nhận thẻ"}
                   </button>
                 </article>
               ))}
-              <article className="card spec-card open-card">
-                <span className="card-type">Open question</span>
-                <p>{analysis.input_idea}</p>
-                <span className="status-chip ambiguous">Mơ hồ</span>
-              </article>
             </section>
-            <StageActions stage={Number(stage)} />
+            {cardConfirmationState === "error" ? (
+              <p className="form-error">Không thể lưu xác nhận thẻ.</p>
+            ) : null}
+            {stageActions}
           </>
         ) : null}
         {stage === "3" ? (
@@ -367,19 +644,64 @@ export default function StagePage() {
                   {analysis.input_idea}
                 </p>
                 <p className="citation-note">
-                  {analysis.related_work.length
-                    ? `${analysis.related_work.length} nguồn cần được kiểm tra trước khi khẳng định novelty.`
+                  {relatedWork.length
+                    ? `${relatedWork.length} nguồn đã lưu, cần được kiểm tra trước khi khẳng định novelty.`
                     : "Chưa có nguồn đã xác minh. Bổ sung related work trước khi chốt novelty claim."}
                 </p>
+                <p className="source-disclaimer">
+                  Gợi ý bên dưới lấy metadata thật từ OpenAlex, với Crossref làm
+                  fallback. Metadata không tự động là evidence đã xác minh.
+                </p>
+                <div className="source-form">
+                  <input
+                    className="route-input"
+                    value={sourceQuery}
+                    onChange={(event) => setSourceQuery(event.target.value)}
+                    placeholder="Từ khóa, tác giả hoặc tiêu đề để tìm Crossref"
+                  />
+                  <button
+                    className="text-action"
+                    disabled={
+                      searchState === "searching" ||
+                      sourceQuery.trim().length < 3
+                    }
+                    onClick={findSources}
+                  >
+                    {searchState === "searching"
+                      ? "Đang tìm..."
+                      : "Tìm nguồn khác"}
+                  </button>
+                  {searchState === "error" ? (
+                    <p className="form-error">
+                      Không thể tìm Crossref. Bạn vẫn có thể nhập nguồn thủ
+                      công.
+                    </p>
+                  ) : null}
+                  <button
+                    className="text-action"
+                    onClick={() => {
+                      setRelatedWorkForm({
+                        title: "",
+                        url: "",
+                        year: null,
+                        approach: "",
+                        limitation: "",
+                      });
+                      setShowRelatedWorkForm(true);
+                    }}
+                  >
+                    Nhập nguồn thủ công
+                  </button>
+                </div>
               </section>
               <section className="card">
-                <h2>Bảng đối sánh related work</h2>
+                <h2>Nguồn học thuật & bảng related work</h2>
                 <div className="compact-table">
-                  {analysis.related_work.length ? (
-                    analysis.related_work.map((paper) => (
+                  {relatedWork.length ? (
+                    relatedWork.map((paper) => (
                       <article key={paper.title}>
                         <strong>
-                          {paper.title} ({paper.year})
+                          {paper.title} {paper.year ? `(${paper.year})` : ""}
                         </strong>
                         <span>{paper.approach}</span>
                         <small>{paper.limitation}</small>
@@ -394,6 +716,149 @@ export default function StagePage() {
                     </p>
                   )}
                 </div>
+                <section className="source-candidates" aria-live="polite">
+                  <h3>Nguồn gợi ý theo ý tưởng</h3>
+                  {searchState === "searching" ? (
+                    <p className="small">
+                      Đang truy xuất metadata học thuật...
+                    </p>
+                  ) : null}
+                  {searchState === "idle" && sourceResults.length === 0 ? (
+                    <p className="small">
+                      Chưa tìm thấy metadata phù hợp. Hãy thử rút gọn từ khóa
+                      hoặc thêm nguồn thủ công.
+                    </p>
+                  ) : null}
+                  {sourceResults.map((source) => (
+                    <article
+                      className="mini-record source-result"
+                      key={source.url}
+                    >
+                      <div className="source-result-header">
+                        <strong>{source.title}</strong>
+                        <span>{source.source_provider}</span>
+                      </div>
+                      <p className="small">
+                        {source.authors} {source.year ? `(${source.year})` : ""}
+                      </p>
+                      <div className="source-result-meta">
+                        {source.venue ? <span>{source.venue}</span> : null}
+                        <span>
+                          {source.cited_by_count.toLocaleString()} citations
+                        </span>
+                        {source.is_open_access ? (
+                          <span>Open access</span>
+                        ) : null}
+                      </div>
+                      <div className="source-result-actions">
+                        <a href={source.url} target="_blank" rel="noreferrer">
+                          Mở DOI / metadata
+                        </a>
+                        <button
+                          className="text-action"
+                          onClick={() => {
+                            setRelatedWorkForm({
+                              title: source.title,
+                              url: source.url,
+                              year: source.year,
+                              approach: "",
+                              limitation: "",
+                            });
+                            setShowRelatedWorkForm(true);
+                            setSourceForm({
+                              ...sourceForm,
+                              title: source.title,
+                              url: source.url,
+                            });
+                          }}
+                        >
+                          Thêm vào related work
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </section>
+                {showRelatedWorkForm || relatedWorkForm.title ? (
+                  <div className="source-form">
+                    <strong>Thêm vào bảng related work</strong>
+                    <input
+                      className="route-input"
+                      value={relatedWorkForm.title}
+                      onChange={(event) =>
+                        setRelatedWorkForm({
+                          ...relatedWorkForm,
+                          title: event.target.value,
+                        })
+                      }
+                      placeholder="Tiêu đề công trình"
+                    />
+                    <input
+                      className="route-input"
+                      value={relatedWorkForm.url}
+                      onChange={(event) =>
+                        setRelatedWorkForm({
+                          ...relatedWorkForm,
+                          url: event.target.value,
+                        })
+                      }
+                      placeholder="URL hoặc DOI"
+                    />
+                    <input
+                      className="route-input"
+                      type="number"
+                      value={relatedWorkForm.year ?? ""}
+                      onChange={(event) =>
+                        setRelatedWorkForm({
+                          ...relatedWorkForm,
+                          year: event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        })
+                      }
+                      placeholder="Năm xuất bản (không bắt buộc)"
+                    />
+                    <textarea
+                      className="route-input"
+                      value={relatedWorkForm.approach}
+                      onChange={(event) =>
+                        setRelatedWorkForm({
+                          ...relatedWorkForm,
+                          approach: event.target.value,
+                        })
+                      }
+                      placeholder="Approach hoặc phương pháp của công trình"
+                    />
+                    <textarea
+                      className="route-input"
+                      value={relatedWorkForm.limitation}
+                      onChange={(event) =>
+                        setRelatedWorkForm({
+                          ...relatedWorkForm,
+                          limitation: event.target.value,
+                        })
+                      }
+                      placeholder="Limitation liên quan đến research gap"
+                    />
+                    <button
+                      className="text-action"
+                      disabled={
+                        relatedWorkState === "saving" ||
+                        relatedWorkForm.title.trim().length < 3 ||
+                        relatedWorkForm.url.trim().length < 8 ||
+                        relatedWorkForm.approach.trim().length < 3 ||
+                        relatedWorkForm.limitation.trim().length < 3
+                      }
+                      onClick={saveRelatedWorkSource}
+                    >
+                      {relatedWorkState === "saving"
+                        ? "Đang lưu..."
+                        : "Lưu vào bảng related work"}
+                    </button>
+                    {relatedWorkState === "error" ? (
+                      <p className="form-error">Không thể lưu related work.</p>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div className="source-form">
                   <input
                     className="route-input"
@@ -477,9 +942,22 @@ export default function StagePage() {
                     </small>
                   </article>
                 ))}
+                {evidenceFindings.length ? (
+                  <div className="evidence-findings">
+                    <h3>Ambiguity & conflict cần xử lý</h3>
+                    {evidenceFindings.map((finding) => (
+                      <p
+                        className={`evidence-status ${finding.kind.toLowerCase()}`}
+                        key={`${finding.kind}-${finding.claim}`}
+                      >
+                        <b>{finding.kind}:</b> {finding.claim}. {finding.detail}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
               </section>
             </div>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "4" ? (
@@ -490,59 +968,111 @@ export default function StagePage() {
                 <p>{gapCard?.content}</p>
                 <h3>Vì sao đây là gap?</h3>
                 <p className="small">
-                  Gap chỉ được xác nhận sau khi đối chiếu related work sinh từ ý
-                  tưởng của bạn.
+                  {relatedWork.length
+                    ? "Các limitation dưới đây được ghi nhận từ bảng related work đã lưu. Chỉ chọn gap khi limitation có ý nghĩa và kiểm tra được bằng thí nghiệm."
+                    : "Chưa có related work đã lưu. Hãy thêm ít nhất một nguồn có approach và limitation trước khi chốt novelty claim."}
+                </p>
+                {relatedWork.length ? (
+                  <div className="gap-evidence-list">
+                    {relatedWork.map((paper) => (
+                      <article key={paper.id}>
+                        <strong>{paper.title}</strong>
+                        <p>
+                          <b>Đã làm:</b> {paper.approach}
+                        </p>
+                        <p>
+                          <b>Limitation:</b> {paper.limitation}
+                        </p>
+                      </article>
+                    ))}
+                  </div>
+                ) : null}
+                {evidenceFindings.length ? (
+                  <div className="gap-finding-list">
+                    {evidenceFindings.map((finding) => (
+                      <p key={`${finding.kind}-${finding.claim}`}>
+                        <b>{finding.kind}:</b> {finding.detail}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
+                <h3>Cách kiểm nghiệm</h3>
+                <p className="small">
+                  {analysis.experiment_plan[0]?.purpose ??
+                    "So sánh approach được đề xuất với baseline trên cùng dữ liệu, metric và resource budget."}
                 </p>
               </section>
               <section className="card">
                 <h2>Chọn hướng contribution</h2>
                 {[
                   [
+                    "focus-gap",
                     "A",
-                    "Thuật toán tối ưu prompt",
-                    "Mutation, selection hoặc search.",
+                    "Giải quyết gap đã xác minh",
+                    gapCard?.content ?? "Đối chiếu limitation từ related work.",
                   ],
                   [
+                    "measure-outcome",
                     "B",
-                    "Claim-evidence verifier",
-                    "Kiểm tra hallucination ở mức claim.",
+                    "Ưu tiên kết quả có thể đo",
+                    "Chốt baseline, metric và điều kiện bác bỏ trước khi mở rộng claim.",
                   ],
                   [
+                    "evidence-first",
                     "C",
-                    "Human-in-the-loop",
-                    "Người dùng xác nhận và điều chỉnh loop.",
+                    "Ưu tiên evidence",
+                    "Thu thập nguồn và quote độc lập trước khi xác nhận novelty.",
                   ],
                   [
+                    "other",
                     "D",
-                    "Kết hợp các hướng",
-                    "Một contribution chính và contribution phụ.",
+                    "Other",
+                    "Nhập contribution hoặc hướng gap riêng.",
                   ],
-                  ["E", "Other", "Nhập hướng riêng."],
-                ].map(([key, title, detail]) => (
+                ].map(([key, label, title, detail]) => (
                   <button
                     className={
                       gapChoice === key
                         ? "choice-choice selected"
                         : "choice-choice"
                     }
-                    onClick={() => void selectGap(key)}
+                    disabled={gapDecisionState === "saving"}
+                    onClick={() => {
+                      if (key === "other") {
+                        setGapChoice(key);
+                        return;
+                      }
+                      void selectGap(
+                        key,
+                        key === "focus-gap" ? `${title}: ${detail}` : title,
+                      );
+                    }}
                     key={key}
                   >
                     <strong>
-                      {key}. {title}
+                      {label}. {title}
                     </strong>
                     <small>{detail}</small>
                   </button>
                 ))}
-                {gapChoice === "E" ? (
+                {gapChoice === "other" ? (
                   <input
                     className="route-input"
                     placeholder="Nhập hướng research riêng"
+                    value={customGap}
+                    onChange={(event) => setCustomGap(event.target.value)}
+                    onBlur={() => {
+                      if (customGap.trim().length >= 3)
+                        void selectGap("other", customGap.trim());
+                    }}
                   />
+                ) : null}
+                {gapDecisionState === "error" ? (
+                  <p className="form-error">Không thể lưu research gap.</p>
                 ) : null}
               </section>
             </div>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "5" ? (
@@ -583,7 +1113,7 @@ export default function StagePage() {
                 ))}
               </section>
             </div>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "6" ? (
@@ -619,17 +1149,34 @@ export default function StagePage() {
                 </p>
               </section>
             </div>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "7" ? (
           <>
-            <div className="route-grid contribution-grid">
+            <div className="route-grid budget-grid">
               <section className="card">
                 <h2>Cấu hình đề xuất</h2>
                 <dl className="budget-list">
                   <dt>Resource</dt>
                   <dd>{analysis.compute_budget.target_resource}</dd>
+                  <dt>Model profile</dt>
+                  <dd>{analysis.compute_budget.model}</dd>
+                  <dt>VRAM ước lượng</dt>
+                  <dd>{analysis.compute_budget.estimated_vram_gb} GB</dd>
+                  <dt>Seed prompts</dt>
+                  <dd>{analysis.compute_budget.seed_prompts}</dd>
+                  <dt>Candidate / vòng</dt>
+                  <dd>{analysis.compute_budget.candidates_per_round}</dd>
+                  <dt>Số vòng</dt>
+                  <dd>{analysis.compute_budget.optimization_rounds}</dd>
+                  <dt>Development / validation</dt>
+                  <dd>
+                    {analysis.compute_budget.development_samples} /{" "}
+                    {analysis.compute_budget.validation_samples} mẫu
+                  </dd>
+                  <dt>Top candidates</dt>
+                  <dd>{analysis.compute_budget.top_candidates}</dd>
                   <dt>Phạm vi</dt>
                   <dd>{analysis.input_idea}</dd>
                 </dl>
@@ -651,43 +1198,59 @@ export default function StagePage() {
                 <p className="citation-note">
                   {analysis.compute_budget.recommendation}
                 </p>
+                <p className="budget-warning">
+                  {analysis.compute_budget.reduction_suggestion}
+                </p>
               </section>
             </div>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "8" ? (
           <>
-            <div className="route-grid contribution-grid">
+            <div className="route-grid spec-grid">
               <section className="card">
-                <h2>Research spec checklist</h2>
-                <ol className="numbered-list">
-                  {[
-                    "Problem statement",
-                    "Research questions",
-                    "Related-work matrix",
-                    "Research gap",
-                    "Proposed approach",
-                    "Expected contributions",
-                    "Claim-evidence matrix",
-                    "Experimental protocol",
-                    "Baselines & metrics",
-                    "Ablation plan",
-                    "Compute budget",
-                    "Risks & limitations",
-                    "Open issues",
-                    "Decision history",
-                  ].map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ol>
+                <h2>Trạng thái research spec</h2>
+                {compiledSpec ? (
+                  <div className="spec-section-list">
+                    {compiledSpec.sections.map((section) => (
+                      <article
+                        className={`spec-section-status ${section.status.toLowerCase()}`}
+                        key={section.key}
+                      >
+                        <span>{SPEC_STATUS_LABELS[section.status]}</span>
+                        <div>
+                          <strong>{section.title}</strong>
+                          <p>{section.detail}</p>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="small">
+                    Đang tổng hợp trạng thái từ nguồn, evidence và decision đã
+                    lưu.
+                  </p>
+                )}
+                {compiledSpec?.blockers.length ? (
+                  <div className="spec-blockers">
+                    <strong>Cần xử lý trước khi chốt:</strong>
+                    <ul>
+                      {compiledSpec.blockers.map((blocker) => (
+                        <li key={blocker}>{blocker}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
               </section>
               <section className="card draft-spec">
-                <h2>Bản spec tạm thời</h2>
-                <pre>{analysis.draft_spec}</pre>
+                <h2>
+                  Bản research spec v{compiledSpec?.version ?? analysis.version}
+                </h2>
+                <pre>{compiledSpec?.content ?? analysis.draft_spec}</pre>
               </section>
             </div>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "9" ? (
@@ -699,7 +1262,7 @@ export default function StagePage() {
               </p>
               <div className="agent-runtime">
                 <strong>
-                  Agent runtime:{" "}
+                  Provider configured:{" "}
                   {analysis.agent_runtime.mode === "live"
                     ? "Live LLM"
                     : "Mock fallback"}
@@ -709,6 +1272,11 @@ export default function StagePage() {
                   {analysis.agent_runtime.model}
                 </span>
               </div>
+              <p className="small">
+                Mỗi lần chạy lại gọi các Judge với context riêng. Nếu provider
+                quá chậm hoặc trả JSON không hợp lệ, hệ thống dùng deterministic
+                fallback thay vì giữ workflow ở trạng thái chờ.
+              </p>
               <button
                 className="text-action"
                 disabled={judgeState === "running"}
@@ -743,20 +1311,60 @@ export default function StagePage() {
               </div>
             </section>
             <section className="consensus-box">
-              <strong>
-                Đồng thuận cho Spec v
-                {consensus?.spec_version_used ?? analysis.version}:
-              </strong>{" "}
-              {consensus?.consensus ?? "Đang tải tổng hợp Judge."}
               {consensus ? (
-                <span>
-                  {" "}
-                  {consensus.major_count} major, {consensus.minor_count} minor.
-                  Bất đồng/vấn đề: {consensus.disagreements.join(" | ")}
-                </span>
-              ) : null}
+                <>
+                  <div className="consensus-heading">
+                    <div>
+                      <strong>
+                        Đồng thuận cho Spec v{consensus.spec_version_used}
+                      </strong>
+                      <p>{consensus.consensus}</p>
+                    </div>
+                    <span className="consensus-score">
+                      {consensus.agreement_score}% đồng thuận
+                    </span>
+                  </div>
+                  <div className="consensus-metrics">
+                    <span>{consensus.judge_count} Judge</span>
+                    <span>{consensus.major_count} MAJOR</span>
+                    <span>{consensus.minor_count} MINOR</span>
+                  </div>
+                  <div className="consensus-details">
+                    <div>
+                      <h3>Nhận định chung</h3>
+                      <ul>
+                        {consensus.agreed_findings.map((finding) => (
+                          <li key={finding}>{finding}</li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div>
+                      <h3>Bất đồng</h3>
+                      {consensus.disagreements.length ? (
+                        <ul>
+                          {consensus.disagreements.map((finding) => (
+                            <li key={finding}>{finding}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p>Không có severity split trong lần chạy này.</p>
+                      )}
+                    </div>
+                  </div>
+                  <details className="role-findings">
+                    <summary>Nhận xét theo từng role</summary>
+                    <ul>
+                      {consensus.role_findings.map((finding) => (
+                        <li key={finding}>{finding}</li>
+                      ))}
+                    </ul>
+                  </details>
+                </>
+              ) : (
+                <p>Đang tải tổng hợp Judge.</p>
+              )}
             </section>
-            <StageActions stage={Number(stage)} />
+            {stageActions}
           </>
         ) : null}
         {stage === "10" ? (
@@ -764,19 +1372,19 @@ export default function StagePage() {
             <section className="card">
               <h2>Xử lý nhận xét Judge</h2>
               <p>
-                Claim hiện tại có phạm vi rộng hơn bằng chứng đang có. Chọn một
-                cách xử lý:
+                Chọn cách xử lý cho các finding, evidence và Judge feedback của
+                workspace hiện tại:
               </p>
               {[
                 [
                   "NARROW_CLAIM",
                   "A. Thu hẹp claim",
-                  "Chỉ khẳng định kết quả trên paper khoa học.",
+                  "Giới hạn kết luận theo evidence và điều kiện đánh giá đã có.",
                 ],
                 [
                   "EXPAND_EXPERIMENT",
                   "B. Mở rộng thí nghiệm",
-                  "Bổ sung thêm domain tài chính hoặc bất động sản.",
+                  "Bổ sung baseline, ablation hoặc split cần thiết để kiểm tra claim.",
                 ],
                 [
                   "TURN_INTO_QUESTION",
@@ -835,9 +1443,30 @@ export default function StagePage() {
                 {analysis.readiness_score}/100
               </p>
               <pre className="revision-preview">{analysis.draft_spec}</pre>
-              <Link className="next-route" href="/final">
-                Xem & xuất bản spec cuối →
-              </Link>
+              {revisionDiff ? (
+                <div className="revision-diff">
+                  <h3>
+                    Diff v{revisionDiff.from_version} → v
+                    {revisionDiff.to_version}
+                  </h3>
+                  <pre>
+                    {revisionDiff.diff_lines.join("\n") ||
+                      "Không có thay đổi nội dung."}
+                  </pre>
+                </div>
+              ) : null}
+              <button
+                className="next-route"
+                disabled={advanceState === "saving"}
+                onClick={() => void advanceStage(10)}
+                type="button"
+              >
+                {isFinalReviewConfirmed
+                  ? "Xem & xuất bản spec cuối →"
+                  : advanceState === "saving"
+                    ? "Đang lưu checkpoint..."
+                    : "Xác nhận review & sang xuất bản →"}
+              </button>
             </section>
           </div>
         ) : null}

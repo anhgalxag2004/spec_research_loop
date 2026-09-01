@@ -2,13 +2,19 @@ from fastapi import APIRouter, HTTPException
 
 from app.schemas import (
     AnalyzeResponse,
+    CompiledSpecResponse,
     DecisionRecord,
     DecisionRequest,
     EvidenceRecord,
+    EvidenceAnalysisResponse,
     EvidenceRequest,
     JudgeExecutionResponse,
     JudgeConsensus,
+    PublicationStatus,
     ResearchInput,
+    RelatedWorkRecord,
+    RelatedWorkRequest,
+    SourceSearchResponse,
     ReviseRequest,
     ReviseResponse,
     VersionDiff,
@@ -26,11 +32,14 @@ from app.services.specloop_service import (
     build_claim_evidence,
     build_experiment_plan,
     build_related_work,
+    compile_research_spec,
     estimate_compute_budget,
     reinterpret_idea,
     readiness_score,
+    analyze_evidence_records,
     revise_spec,
     run_mock_judges,
+    search_scholarly_sources,
 )
 from app.storage import (
     create_project,
@@ -38,12 +47,16 @@ from app.storage import (
     get_decisions,
     get_evidence,
     get_judge_consensus,
+    get_related_work,
     get_project_history,
+    get_publication,
     get_version_diff,
     save_decision,
     save_evidence,
     save_judge_runs,
+    save_related_work,
     save_revision,
+    publish_project,
     update_workflow_checkpoint,
 )
 
@@ -55,9 +68,14 @@ def analyze_research_idea(payload: ResearchInput) -> AnalyzeResponse:
     plan = generate_research_plan(payload.idea, payload.target_resource)
     cards = plan.cards if plan else decompose_idea(payload.idea, payload.target_resource)
     draft_spec = plan.draft_spec if plan else build_draft_spec(payload.idea, cards)
-    judges = generate_judges(draft_spec) or run_mock_judges()
+    judges = run_mock_judges()
     score = readiness_score(judges)
-    project_id, created_at = create_project(payload.idea, draft_spec, score)
+    project_id, created_at = create_project(
+        payload.idea,
+        draft_spec,
+        score,
+        payload.target_resource,
+    )
     judge_runs = save_judge_runs(
         project_id,
         1,
@@ -81,6 +99,86 @@ def analyze_research_idea(payload: ResearchInput) -> AnalyzeResponse:
         agent_runtime=runtime_metadata(),
         judge_runs=judge_runs,
     )
+
+
+@router.get("/{project_id}/compiled-spec", response_model=CompiledSpecResponse)
+def compile_project_spec(project_id: str) -> CompiledSpecResponse:
+    try:
+        latest_spec = get_latest_spec(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+    budget = estimate_compute_budget(str(latest_spec["target_resource"]))
+    content, sections, blockers = compile_research_spec(
+        latest_spec,
+        get_related_work(project_id),
+        get_evidence(project_id),
+        get_decisions(project_id),
+        budget,
+    )
+    return CompiledSpecResponse(
+        project_id=project_id,
+        version=int(latest_spec["version"]),
+        content=content,
+        sections=sections,
+        blockers=blockers,
+    )
+
+
+@router.get("/{project_id}/publication", response_model=PublicationStatus)
+def project_publication(project_id: str) -> PublicationStatus:
+    try:
+        return PublicationStatus(**get_publication(project_id))
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/{project_id}/publish", response_model=PublicationStatus)
+def publish_latest_spec(project_id: str) -> PublicationStatus:
+    try:
+        latest_spec = get_latest_spec(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+    version = int(latest_spec["version"])
+    existing_publication = get_publication(project_id)
+    if (
+        existing_publication["workflow_status"] == "PUBLISHED"
+        and existing_publication["published_version"] == version
+    ):
+        return PublicationStatus(**existing_publication)
+
+    budget = estimate_compute_budget(str(latest_spec["target_resource"]))
+    content, _, blockers = compile_research_spec(
+        latest_spec,
+        get_related_work(project_id),
+        get_evidence(project_id),
+        get_decisions(project_id),
+        budget,
+    )
+    if blockers:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Resolve all specification blockers before publication.",
+                "blockers": blockers,
+            },
+        )
+
+    save_decision(
+        project_id,
+        version,
+        "FINAL_PUBLICATION",
+        "Published the canonical research specification.",
+    )
+    content, _, _ = compile_research_spec(
+        latest_spec,
+        get_related_work(project_id),
+        get_evidence(project_id),
+        get_decisions(project_id),
+        budget,
+    )
+    return PublicationStatus(**publish_project(project_id, version, content))
 
 
 @router.post("/revise", response_model=ReviseResponse)
@@ -129,7 +227,14 @@ def run_latest_spec_judges(project_id: str) -> JudgeExecutionResponse:
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
-    judges = generate_judges(str(latest_spec["draft_spec"])) or run_mock_judges()
+    canonical_spec, _, _ = compile_research_spec(
+        latest_spec,
+        get_related_work(project_id),
+        get_evidence(project_id),
+        get_decisions(project_id),
+        estimate_compute_budget(str(latest_spec["target_resource"])),
+    )
+    judges = generate_judges(canonical_spec) or run_mock_judges()
     version = int(latest_spec["version"])
     judge_runs = save_judge_runs(
         project_id,
@@ -181,6 +286,37 @@ def record_evidence(project_id: str, payload: EvidenceRequest) -> EvidenceRecord
     return EvidenceRecord(**record)
 
 
+@router.get("/{project_id}/sources/search", response_model=SourceSearchResponse)
+def search_project_sources(project_id: str, query: str) -> SourceSearchResponse:
+    try:
+        get_latest_spec(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    cleaned_query = query.strip()
+    if len(cleaned_query) < 3:
+        raise HTTPException(status_code=422, detail="Search query must contain at least 3 characters.")
+    return SourceSearchResponse(query=cleaned_query, sources=search_scholarly_sources(cleaned_query))
+
+
+@router.post("/{project_id}/related-work", response_model=RelatedWorkRecord)
+def record_related_work(project_id: str, payload: RelatedWorkRequest) -> RelatedWorkRecord:
+    try:
+        latest_spec = get_latest_spec(project_id)
+        record = save_related_work(project_id, int(latest_spec["version"]), payload.model_dump())
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return RelatedWorkRecord(**record)
+
+
+@router.get("/{project_id}/related-work", response_model=list[RelatedWorkRecord])
+def project_related_work(project_id: str) -> list[RelatedWorkRecord]:
+    try:
+        get_latest_spec(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return [RelatedWorkRecord(**record) for record in get_related_work(project_id)]
+
+
 @router.get("/{project_id}/evidence", response_model=list[EvidenceRecord])
 def project_evidence(project_id: str) -> list[EvidenceRecord]:
     try:
@@ -188,6 +324,18 @@ def project_evidence(project_id: str) -> list[EvidenceRecord]:
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     return [EvidenceRecord(**record) for record in get_evidence(project_id)]
+
+
+@router.get("/{project_id}/evidence/analysis", response_model=EvidenceAnalysisResponse)
+def analyze_project_evidence(project_id: str) -> EvidenceAnalysisResponse:
+    try:
+        records = get_evidence(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return EvidenceAnalysisResponse(
+        project_id=project_id,
+        findings=analyze_evidence_records(records),
+    )
 
 
 @router.get("/{project_id}/consensus", response_model=JudgeConsensus)

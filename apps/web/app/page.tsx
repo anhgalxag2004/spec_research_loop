@@ -7,13 +7,19 @@ import { CardList } from "@/components/CardList";
 import { JudgePanel } from "@/components/JudgePanel";
 import {
   AnalyzeResponse,
+  DecisionRecord,
   VersionHistoryItem,
   analyzeIdea,
   getActiveWorkspace,
+  getDecisions,
   getProjectHistory,
   reviseSpec,
+  saveDecision,
   setActiveWorkspace,
 } from "@/lib/api";
+import { getHighestAccessibleStage } from "@/lib/workflow";
+
+const CLARIFICATION_QUESTION_COUNT = 3;
 
 export default function HomePage() {
   const router = useRouter();
@@ -36,6 +42,20 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [customAnswers, setCustomAnswers] = useState<Record<string, string>>(
+    {},
+  );
+  const [interpretationDraft, setInterpretationDraft] = useState("");
+  const [exampleVariant, setExampleVariant] = useState(0);
+  const [confirmationState, setConfirmationState] = useState<
+    "idle" | "saving" | "error"
+  >("idle");
+  const [confirmedInterpretation, setConfirmedInterpretation] = useState("");
+  const [persistedClarificationCount, setPersistedClarificationCount] =
+    useState(0);
+  const [workflowDecisions, setWorkflowDecisions] = useState<DecisionRecord[]>(
+    [],
+  );
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authName, setAuthName] = useState("");
@@ -49,11 +69,81 @@ export default function HomePage() {
     () => revision || analysis?.draft_spec || "",
     [analysis, revision],
   );
+  const hasUsableIdea = idea.trim().length >= 20;
+  const hasCurrentAnalysis = Boolean(
+    analysis && analysis.input_idea.trim() === idea.trim(),
+  );
+  const answeredClarificationCount = Object.entries(answers).filter(
+    ([key, value]) =>
+      Boolean(value) &&
+      (value !== "Other" || (customAnswers[key]?.trim().length ?? 0) >= 3),
+  ).length;
+  const clarificationCount = Math.max(
+    answeredClarificationCount,
+    persistedClarificationCount,
+  );
+  const isInterpretationConfirmed =
+    hasCurrentAnalysis &&
+    Boolean(confirmedInterpretation) &&
+    confirmedInterpretation.trim() === interpretationDraft.trim();
+  const accessibleStage = getHighestAccessibleStage(workflowDecisions);
+  const progressLabel = loading
+    ? "Đang phân tích ý tưởng"
+    : isInterpretationConfirmed
+      ? "Cách hiểu đã được xác nhận"
+      : hasCurrentAnalysis
+        ? "Đang chờ xác nhận cách hiểu"
+        : hasUsableIdea
+          ? "Sẵn sàng phân tích"
+          : "Đang chờ ý tưởng nghiên cứu";
+  const nextStepHint = loading
+    ? "Hệ thống đang tạo diễn giải và các thẻ nghiên cứu ban đầu."
+    : !hasUsableIdea
+      ? "Nhập ít nhất 20 ký tự để bắt đầu phân tích."
+      : !hasCurrentAnalysis
+        ? "Chọn Phân tích ý tưởng để tạo cách hiểu ban đầu."
+        : !isInterpretationConfirmed
+          ? "Kiểm tra, chỉnh sửa nếu cần, rồi lưu xác nhận cách hiểu."
+          : "Checkpoint đã lưu. Bạn có thể tiếp tục sang bước phân rã ý tưởng.";
 
   useEffect(() => {
     const session = localStorage.getItem("specloop-session");
     if (session) setUserName(JSON.parse(session).name);
   }, []);
+
+  useEffect(() => {
+    if (!analysis) {
+      setConfirmedInterpretation("");
+      setPersistedClarificationCount(0);
+      setWorkflowDecisions([]);
+      return;
+    }
+
+    let cancelled = false;
+    void getDecisions(analysis.project_id)
+      .then((decisions) => {
+        if (cancelled) return;
+        setWorkflowDecisions(decisions);
+        const savedInterpretation = decisions.find(
+          (decision) => decision.decision_type === "IDEA_INTERPRETATION",
+        );
+        setConfirmedInterpretation(savedInterpretation?.value ?? "");
+        setPersistedClarificationCount(
+          new Set(
+            decisions
+              .filter((decision) =>
+                decision.decision_type.startsWith("CLARIFICATION_"),
+              )
+              .map((decision) => decision.decision_type),
+          ).size,
+        );
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [analysis?.project_id]);
 
   useEffect(() => {
     const cachedWorkspace = getActiveWorkspace();
@@ -79,6 +169,7 @@ export default function HomePage() {
     setVersion(restored.version);
     setReadinessScore(restored.readiness_score);
     setCurrentJudges(restored.judges);
+    setInterpretationDraft(restored.interpreted_idea);
     setActiveStage(1);
   }, []);
 
@@ -106,12 +197,61 @@ export default function HomePage() {
       sessionStorage.setItem("specloop-workspace", JSON.stringify(data));
       sessionStorage.setItem("specloop-workspace-idea", idea);
       sessionStorage.setItem("specloop-workspace-resource", resource);
-      setActiveStage(2);
-      router.push("/step/2");
+      setInterpretationDraft(data.interpreted_idea);
+      setExampleVariant(0);
+      setConfirmationState("idle");
+      setConfirmedInterpretation("");
+      setPersistedClarificationCount(0);
+      setWorkflowDecisions([]);
+      setActiveStage(1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function confirmInterpretation() {
+    if (!analysis) return;
+    const interpretedIdea =
+      interpretationDraft.trim() || analysis.interpreted_idea;
+    const clarificationDecisions = Object.entries(answers)
+      .filter(([, value]) => Boolean(value))
+      .map(([key, value]) =>
+        saveDecision(
+          analysis.project_id,
+          `CLARIFICATION_${key.toUpperCase()}`,
+          value === "Other" ? customAnswers[key]?.trim() || "Other" : value,
+        ),
+      );
+
+    setConfirmationState("saving");
+    setError("");
+    try {
+      await Promise.all([
+        saveDecision(
+          analysis.project_id,
+          "IDEA_INTERPRETATION",
+          interpretedIdea,
+        ),
+        ...clarificationDecisions,
+      ]);
+      const workspace = { ...analysis, interpreted_idea: interpretedIdea };
+      setAnalysis(workspace);
+      setConfirmedInterpretation(interpretedIdea);
+      setPersistedClarificationCount(
+        Math.max(persistedClarificationCount, answeredClarificationCount),
+      );
+      setActiveWorkspace(workspace);
+      sessionStorage.setItem("specloop-workspace", JSON.stringify(workspace));
+      router.push("/step/2");
+    } catch (err) {
+      setConfirmationState("error");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Không thể lưu xác nhận cách hiểu.",
+      );
     }
   }
 
@@ -343,38 +483,103 @@ export default function HomePage() {
                           ? "option selected"
                           : "option"
                       }
-                      onClick={() =>
+                      onClick={() => {
                         setAnswers((current) => ({
                           ...current,
                           [key as string]: option,
-                        }))
-                      }
+                        }));
+                        setConfirmedInterpretation("");
+                      }}
                       key={option}
                     >
                       {option}
                     </button>
                   ))}
                 </div>
+                {answers[key as string] === "Other" ? (
+                  <input
+                    className="other-answer-input"
+                    value={customAnswers[key as string] ?? ""}
+                    onChange={(event) => {
+                      setCustomAnswers((current) => ({
+                        ...current,
+                        [key as string]: event.target.value,
+                      }));
+                      setConfirmedInterpretation("");
+                    }}
+                    placeholder="Nhập lựa chọn riêng"
+                  />
+                ) : null}
                 <small>✦ Ví dụ giúp hệ thống hiểu đúng ngữ cảnh.</small>
               </div>
             ))}
           </article>
         </section>
 
-        <section className="flowbar">
+        <section className="flowbar" aria-live="polite">
           <div className="flow-label">
-            ▤ <strong>Tóm tắt sau vòng 1</strong>
+            ▤ <strong>{progressLabel}</strong>
           </div>
           <div className="flow-steps">
-            <span className="done">● Ý tưởng</span>
-            <span className="done">● Làm rõ</span>
-            <span className="current">3 Xác nhận</span>
-            <span>4 Sang bước tiếp theo</span>
+            <span className={hasUsableIdea ? "done" : "current"}>
+              1 Ý tưởng{" "}
+              <small>
+                {hasUsableIdea ? "đã nhập" : "cần tối thiểu 20 ký tự"}
+              </small>
+            </span>
+            <span
+              className={
+                hasCurrentAnalysis
+                  ? "done"
+                  : hasUsableIdea
+                    ? "current"
+                    : "pending"
+              }
+            >
+              2 Diễn giải{" "}
+              <small>
+                {loading
+                  ? "đang tạo"
+                  : hasCurrentAnalysis
+                    ? "đã tạo"
+                    : "chờ phân tích"}
+              </small>
+            </span>
+            <span
+              className={
+                isInterpretationConfirmed ||
+                clarificationCount === CLARIFICATION_QUESTION_COUNT
+                  ? "done"
+                  : hasCurrentAnalysis
+                    ? "current"
+                    : "pending"
+              }
+            >
+              3 Làm rõ{" "}
+              <small>
+                {clarificationCount}/{CLARIFICATION_QUESTION_COUNT} câu trả lời
+              </small>
+            </span>
+            <span
+              className={
+                isInterpretationConfirmed
+                  ? "done"
+                  : hasCurrentAnalysis
+                    ? "current"
+                    : "pending"
+              }
+            >
+              4 Xác nhận{" "}
+              <small>
+                {confirmationState === "saving"
+                  ? "đang lưu"
+                  : isInterpretationConfirmed
+                    ? "đã lưu"
+                    : "chờ xác nhận"}
+              </small>
+            </span>
           </div>
-          <div className="hint">
-            ✦ Gợi ý: Bạn có thể sửa trực tiếp phần hệ thống hiểu nếu thấy chưa
-            đúng.
-          </div>
+          <div className="hint">✦ {nextStepHint}</div>
         </section>
 
         <section className="stage-nav" aria-label="Các bước xây dựng spec">
@@ -389,21 +594,98 @@ export default function HomePage() {
             [8, "Research spec", "/step/8"],
             [9, "Judge", "/step/9"],
             [10, "Sửa đổi", "/step/10"],
-          ].map(([step, label, href]) => (
-            <a
-              key={step}
-              className={activeStage === step ? "stage active-stage" : "stage"}
-              href={href as string}
-            >
-              <b>{step}</b>
-              <span>{label}</span>
-            </a>
-          ))}
+          ].map(([step, label, href]) => {
+            const targetStage = Number(step);
+            const isLocked = targetStage > accessibleStage;
+            if (isLocked) {
+              return (
+                <span
+                  aria-disabled="true"
+                  className="stage locked"
+                  key={step}
+                  title={`Hoàn thành bước ${accessibleStage} trước để mở bước này.`}
+                >
+                  <b>{step}</b>
+                  <span>{label}</span>
+                </span>
+              );
+            }
+            return (
+              <a
+                key={step}
+                className={
+                  activeStage === targetStage ? "stage active-stage" : "stage"
+                }
+                href={href as string}
+              >
+                <b>{step}</b>
+                <span>{label}</span>
+              </a>
+            );
+          })}
         </section>
 
         {error ? <p className="error-message">{error}</p> : null}
 
-        {analysis ? (
+        {analysis && hasCurrentAnalysis ? (
+          <section className="card clarification-confirmation">
+            <div>
+              <p className="eyebrow">Checkpoint 1</p>
+              <h2>Tôi đang hiểu đúng ý tưởng của bạn không?</h2>
+              <p className="small">
+                Bạn có thể xác nhận, sửa cách hiểu bên dưới, hoặc xem một ví dụ
+                khác trước khi phân rã ý tưởng.
+              </p>
+            </div>
+            <textarea
+              aria-label="Cách hiểu về ý tưởng"
+              className="interpretation-editor"
+              rows={4}
+              value={interpretationDraft}
+              onChange={(event) => setInterpretationDraft(event.target.value)}
+            />
+            <div className="clarification-example">
+              <strong>Ví dụ {exampleVariant + 1}</strong>
+              <p>
+                {exampleVariant % 2 === 0
+                  ? `Với ý tưởng "${analysis.input_idea}", hệ thống sẽ xác định vấn đề, baseline, evidence cần có và cách kiểm tra kết quả trong cùng giới hạn tài nguyên.`
+                  : `Ví dụ cách diễn giải khác: nghiên cứu sẽ biến "${analysis.input_idea}" thành một giả thuyết có thể bác bỏ, sau đó đối chiếu bằng related work và thí nghiệm công bằng.`}
+              </p>
+            </div>
+            <div className="clarification-actions">
+              <button
+                className="secondary-route"
+                onClick={() => setExampleVariant((current) => current + 1)}
+                type="button"
+              >
+                Ví dụ khác
+              </button>
+              <button
+                className="primary-inline-action"
+                disabled={confirmationState === "saving"}
+                onClick={() => {
+                  if (isInterpretationConfirmed) {
+                    router.push("/step/2");
+                    return;
+                  }
+                  void confirmInterpretation();
+                }}
+                type="button"
+              >
+                {isInterpretationConfirmed
+                  ? "Tiếp tục sang bước phân rã"
+                  : confirmationState === "saving"
+                    ? "Đang lưu xác nhận..."
+                    : "Xác nhận & sang bước phân rã"}
+              </button>
+            </div>
+            {confirmationState === "error" ? (
+              <p className="form-error">Không thể lưu checkpoint làm rõ.</p>
+            ) : null}
+          </section>
+        ) : null}
+
+        {analysis && activeStage > 1 ? (
           <>
             <section id="project" className="card result-card">
               <h2>Interpreted Idea</h2>

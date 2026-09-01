@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = ""
     llm_timeout_seconds: int = 120
+    llm_interactive_timeout_seconds: int = 25
+    llm_judge_parallelism: int = 5
 
 
 settings = Settings()

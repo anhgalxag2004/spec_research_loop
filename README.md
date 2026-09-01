@@ -45,9 +45,12 @@ planning, independent Judge reviews, user revisions, and final Markdown export.
   prompt-optimization example.
 - Source/evidence records with `SUPPORTED`, `CONTRADICTED`, and `INSUFFICIENT`
   verdicts, each stored with source URL and quoted passage.
+- OpenAlex metadata search with Crossref fallback, plus a persistent related-
+  work matrix with researcher-supplied approach and limitation annotations.
 - Persistent user decisions for gap selection, revision strategy, and final
   publication confirmation.
-- Version history and server-side unified diff between two spec versions.
+- Version history, arbitrary server-side diff between two spec versions, and
+  an immutable final-publication snapshot with version/timestamp provenance.
 - Judge provenance through `spec_version_used`; old Judge results become stale
   when a newer spec is created.
 - Configurable AI runtime with transparent `live` or deterministic fallback
@@ -85,7 +88,13 @@ More detail is available in [ARCHITECTURE.md](ARCHITECTURE.md).
    LLM_BASE_URL=http://host.docker.internal:11434/v1
    LLM_API_KEY=ollama
    LLM_MODEL=qwen3:4b
+   LLM_INTERACTIVE_TIMEOUT_SECONDS=25
+   LLM_JUDGE_PARALLELISM=5
    ```
+
+Step 1 uses a bounded planner request and falls back to deterministic
+decomposition when a provider is slow or returns invalid structured output.
+Step 9 runs the five independent Judge roles with separate contexts.
 
 3. Start Docker Desktop, then run:
 
@@ -114,7 +123,7 @@ docker-compose.yml        Local runtime configuration
 Run backend acceptance tests:
 
 ```powershell
-docker compose run --rm --no-deps --entrypoint sh api -c "cd /app && PYTHONPATH=/app uv run --no-project --with pytest --with httpx2 pytest"
+docker compose run --rm --no-deps --entrypoint sh api -c "cd /app && PYTHONPATH=/app uv run --no-project --with pytest --with httpx pytest tests/test_spec_flow.py"
 ```
 
 Build the frontend:
@@ -129,12 +138,17 @@ docker compose run --rm --no-deps web npm run build
 - [Prompt catalogue](docs/prompts.md)
 - [Use-case dataset](dataset/use-cases.json)
 - [Evaluation protocol with two baselines](docs/evaluation-protocol.md)
+- [Engineering evaluation report](docs/evaluation-report.md)
+- [Demo video script](docs/demo-script.md)
+- [Sample fourteen-section research spec](examples/flood-risk-research-spec.md)
 
 ## Evidence Scope
 
-Step 3 allows a researcher to store a source URL, target claim, quote, and
-verification verdict. The current release does not automatically crawl
-scholarly databases; automatic search/retrieval is a planned integration.
+Step 3 automatically retrieves bibliographic candidates from OpenAlex, with
+Crossref as a fallback, then lets a researcher save selected sources to the
+related-work matrix. A researcher must still inspect the source and enter the
+claim, quote, and verification verdict; metadata retrieval alone is never
+treated as verified evidence.
 
 ## Local Development (Optional)
 
@@ -152,6 +166,6 @@ scholarly databases; automatic search/retrieval is a planned integration.
 
 ## Future Improvements
 
-- Add an external scholarly search/retrieval connector for automatic evidence collection.
+- Add full-text scholarly retrieval and quote alignment for automatic evidence collection.
 - Add multi-provider Judge assignment to compare model bias.
 - Add a full evaluation report generated from repeated use-case runs.

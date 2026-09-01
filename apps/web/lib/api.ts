@@ -69,10 +69,43 @@ export interface ExperimentPlan {
 
 export interface ComputeBudget {
   target_resource: string;
+  model: string;
+  estimated_vram_gb: number;
+  seed_prompts: number;
+  candidates_per_round: number;
+  optimization_rounds: number;
+  development_samples: number;
+  validation_samples: number;
+  top_candidates: number;
   estimated_hours: number;
   estimated_llm_calls: number;
   estimated_token_budget: number;
   recommendation: string;
+  reduction_suggestion: string;
+}
+
+export interface SpecSectionStatus {
+  key: string;
+  title: string;
+  status: "READY" | "NEEDS_INPUT" | "WARNING";
+  detail: string;
+}
+
+export interface CompiledSpecResponse {
+  project_id: string;
+  version: number;
+  content: string;
+  sections: SpecSectionStatus[];
+  blockers: string[];
+}
+
+export interface PublicationStatus {
+  project_id: string;
+  workflow_status: "ACTIVE" | "PUBLISHED";
+  current_version: number;
+  published_version: number | null;
+  published_at: string | null;
+  content: string | null;
 }
 
 export interface AnalyzeResponse {
@@ -130,14 +163,46 @@ export interface EvidenceRecord {
   created_at: string;
 }
 
+export interface SourceSearchItem {
+  title: string;
+  year: number | null;
+  url: string;
+  authors: string;
+  venue: string | null;
+  source_provider: string;
+  cited_by_count: number;
+  is_open_access: boolean;
+}
+
+export interface RelatedWorkRecord {
+  id: string;
+  title: string;
+  url: string;
+  year: number | null;
+  approach: string;
+  limitation: string;
+  spec_version: number;
+  created_at: string;
+}
+
+export interface EvidenceFinding {
+  kind: "AMBIGUITY" | "CONFLICT";
+  claim: string;
+  detail: string;
+  evidence_ids: string[];
+}
+
 export interface JudgeConsensus {
   project_id: string;
   spec_version_used: number;
   judge_count: number;
   major_count: number;
   minor_count: number;
+  agreement_score: number;
   consensus: string;
+  agreed_findings: string[];
   disagreements: string[];
+  role_findings: string[];
 }
 
 export interface VersionDiff {
@@ -234,6 +299,45 @@ export async function getProjectHistory(
   return (await response.json()) as VersionHistoryItem[];
 }
 
+export async function getCompiledSpec(
+  projectId: string,
+): Promise<CompiledSpecResponse> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/spec/${projectId}/compiled-spec`,
+  );
+  if (!response.ok)
+    throw new Error(`Compiled spec failed with status ${response.status}`);
+  return (await response.json()) as CompiledSpecResponse;
+}
+
+export async function getPublication(
+  projectId: string,
+): Promise<PublicationStatus> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/spec/${projectId}/publication`,
+  );
+  if (!response.ok)
+    throw new Error(`Publication status failed with status ${response.status}`);
+  return (await response.json()) as PublicationStatus;
+}
+
+export async function publishSpec(
+  projectId: string,
+): Promise<PublicationStatus> {
+  const response = await fetch(`${API_BASE}/api/v1/spec/${projectId}/publish`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as {
+      detail?: { message?: string } | string;
+    } | null;
+    const detail =
+      typeof body?.detail === "string" ? body.detail : body?.detail?.message;
+    throw new Error(detail ?? `Publish failed with status ${response.status}`);
+  }
+  return (await response.json()) as PublicationStatus;
+}
+
 export async function saveDecision(
   projectId: string,
   decisionType: string,
@@ -287,6 +391,57 @@ export async function getEvidence(
   if (!response.ok)
     throw new Error(`Evidence failed with status ${response.status}`);
   return (await response.json()) as EvidenceRecord[];
+}
+
+export async function searchSources(
+  projectId: string,
+  query: string,
+): Promise<SourceSearchItem[]> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/spec/${projectId}/sources/search?query=${encodeURIComponent(query)}`,
+  );
+  if (!response.ok)
+    throw new Error(`Source search failed with status ${response.status}`);
+  return ((await response.json()) as { sources: SourceSearchItem[] }).sources;
+}
+
+export async function getEvidenceAnalysis(
+  projectId: string,
+): Promise<EvidenceFinding[]> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/spec/${projectId}/evidence/analysis`,
+  );
+  if (!response.ok)
+    throw new Error(`Evidence analysis failed with status ${response.status}`);
+  return ((await response.json()) as { findings: EvidenceFinding[] }).findings;
+}
+
+export async function saveRelatedWork(
+  projectId: string,
+  item: Omit<RelatedWorkRecord, "id" | "spec_version" | "created_at">,
+): Promise<RelatedWorkRecord> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/spec/${projectId}/related-work`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(item),
+    },
+  );
+  if (!response.ok)
+    throw new Error(`Related work save failed with status ${response.status}`);
+  return (await response.json()) as RelatedWorkRecord;
+}
+
+export async function getRelatedWork(
+  projectId: string,
+): Promise<RelatedWorkRecord[]> {
+  const response = await fetch(
+    `${API_BASE}/api/v1/spec/${projectId}/related-work`,
+  );
+  if (!response.ok)
+    throw new Error(`Related work failed with status ${response.status}`);
+  return (await response.json()) as RelatedWorkRecord[];
 }
 
 export async function getJudgeConsensus(
